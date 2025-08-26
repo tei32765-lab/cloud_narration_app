@@ -1,0 +1,9 @@
+streamlit
+requests
+python-dotenv
+gtts
+kittentts
+soundfile
+openai
+pandas
+python-docx
