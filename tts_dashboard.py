@@ -1,17 +1,17 @@
 # 📚 Imports
+import subprocess
+import re
+import docx
 import streamlit as st
 import requests
 import json
 import base64
+import zipfile
 import os
-from dotenv import load_dotenv  # Optional: only if you're using .env locally during testing
+from io import BytesIO
 from gtts import gTTS 
 
-load_dotenv()
-api_key = os.getenv("OPENROUTER_API_KEY")
-# 📂 Output folder
-output_folder = "mcq_outputs"
-os.makedirs(output_folder, exist_ok=True)
+api_key = st.secrets["OPENROUTER_API_KEY"]  # ✅ Cloud‑native secret loading
 
 # 🧠 Load pronunciation overrides
 with open("pronunciation.json", "r") as f:
@@ -66,12 +66,11 @@ def read_uploaded_file(file):
 
 # 🧩 Split MCQs
 def split_into_mcqs(text):
-    # Normalize all line endings
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Collapse triple+ newlines into exactly two
+    if not text or not isinstance(text, str):
+        return []  # or return a default list of MCQs
     text = re.sub(r"\n{3,}", "\n\n", text)
-    # Split into chunks, remove any empties
-    return [chunk.strip() for chunk in text.split("\n\n") if chunk.strip()]
+    # ... rest of your MCQ splitting logic ...
+    return mcqs
 
 # 🛠 Save MP3
 def get_output_filename(index):
@@ -79,29 +78,27 @@ def get_output_filename(index):
 
 # 🗜️ Zipper
 def create_zip_of_outputs():
-    zip_path = os.path.join(output_folder, "mcq_outputs.zip")
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        for f in os.listdir(output_folder):
-            if f.endswith(".mp3") or f.endswith(".wav"):
-                zipf.write(os.path.join(output_folder, f), arcname=f)
-    return zip_path
+    """
+    Creates a ZIP file in memory from audio files stored in st.session_state["session_files"].
+    Each entry in session_files should be a tuple: (filename, file_bytes).
+    """
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as zipf:
+        for filename, file_bytes in st.session_state.get("session_files", []):
+            zipf.writestr(filename, file_bytes)
+    zip_buffer.seek(0)
+    return zip_buffer
 
-# 🎙️ Local narration (adjustable rate + pauses)
-def narrate_with_pyttsx3(text, output_path, rate=150):
+from gtts import gTTS
+
+def narrate_with_gtts(text, output_path, lang="en"):
     try:
-        import pythoncom
-        pythoncom.CoInitialize()
-        engine = pyttsx3.init()
-        engine.setProperty("rate", rate)
-        engine.save_to_file(text, output_path)
-        engine.runAndWait()
-        engine.stop()
+        tts = gTTS(text=text, lang=lang)
+        tts.save(output_path)
         return True
     except Exception as e:
-        print(f"Local TTS error: {e}")
+        st.warning(f"gTTS error: {e}")
         return False
-    finally:
-        pythoncom.CoUninitialize()
 
 import requests
 
@@ -261,10 +258,10 @@ st.subheader("📚 Narrate MCQ Batch")
 
 if st.button("🎤 Narrate All"):
     combined_text = "\n\n".join(filter(None, [
-    raw_text,
-    read_uploaded_file(uploaded_file) if uploaded_file else "",
-    st.session_state.get("gpt_text", "").strip()
-]))
+        raw_text,
+        read_uploaded_file(uploaded_file) if uploaded_file else "",
+        st.session_state.get("gpt_text", "").strip()
+    ]))
 
     if not combined_text.strip():
         st.warning("⚠️ Provide MCQs or generate with GPT")
@@ -272,13 +269,16 @@ if st.button("🎤 Narrate All"):
         mcqs = split_into_mcqs(combined_text)
         mcqs = list(dict.fromkeys(mcqs))  # Now safe to deduplicate
 
-
         # 🔒 Create isolated session folder
         import time
         session_id = f"session_{int(time.time())}"
-        session_folder = os.path.join(output_folder, session_id)
+        st.session_state["session_id"] = session_id
+        session_folder = os.path.join(os.getcwd(), session_id)
         os.makedirs(session_folder, exist_ok=True)
         st.session_state["session_folder"] = session_folder
+
+        # Initialise in‑memory storage for this session
+        st.session_state["session_files"] = []
 
         # Proceed with narration...
         st.info(f"🔄 Processing {len(mcqs)} files...")
@@ -292,57 +292,51 @@ if st.button("🎤 Narrate All"):
             cleaned += "." * int(pause_interval * 2)
             path = os.path.join(session_folder, get_output_filename(i))
 
-    if engine_choice == "Local (pyttsx3)":
-        import threading
-        def run_local_tts(cleaned, path, rate, index):
-            try:
-                import pythoncom
-                pythoncom.CoInitialize()
-                success = narrate_with_pyttsx3(cleaned, path, rate)
-                pythoncom.CoUninitialize()
-            except Exception as e:
-                print(f"Threaded TTS error: {e}")
-                success = False
-            if not success:
-                st.warning(f"⚠️ Local TTS failed for MCQ #{index}")
-        thread = threading.Thread(target=run_local_tts, args=(cleaned, path, rate, i))
-        thread.start()
-        thread.join()
+            if engine_choice == "gTTS":
+                success = narrate_with_gtts(cleaned, path)
+                if not success:
+                    st.warning(f"⚠️ gTTS failed for MCQ #{i}")
 
-    elif engine_choice == "ElevenLabs":
-        if not voice_id or not api_key:
-            st.warning("❗ Missing ElevenLabs credentials")
-        else:
-            success = narrate_with_elevenlabs(cleaned, path, voice_id, api_key)
-            if not success:
-                st.warning(f"⚠️ ElevenLabs failed for MCQ #{i}")
-
-    elif engine_choice == "Kitten TTS":
-        success = narrate_with_kittentts(cleaned, path)
-        if not success:
-            st.warning(f"⚠️ Failed to narrate MCQ #{i}")
-
-    # 🔁 Fallback logic
-    if not success:
-        st.info(f"🔁 Trying fallback engine for MCQ #{i}")
-        fallback_order = ["Kitten TTS", "Local (pyttsx3)", "ElevenLabs"]
-        for fallback in fallback_order:
-            if fallback == engine_choice:
-                continue
-            try:
-                if fallback == "Kitten TTS":
-                    success = narrate_with_kittentts(cleaned, path)
-                elif fallback == "Local (pyttsx3)":
-                    success = narrate_with_pyttsx3(cleaned, path, rate)
-                elif fallback == "ElevenLabs":
+            elif engine_choice == "ElevenLabs":
+                if not voice_id or not api_key:
+                    st.warning("❗ Missing ElevenLabs credentials")
+                else:
                     success = narrate_with_elevenlabs(cleaned, path, voice_id, api_key)
-                if success:
-                    st.success(f"✅ Fallback succeeded with {fallback} for MCQ #{i}")
-                    break
-            except Exception as e:
-                print(f"❌ Fallback {fallback} failed: {e}")
+                    if not success:
+                        st.warning(f"⚠️ ElevenLabs failed for MCQ #{i}")
 
-        progress.progress(i / len(mcqs))
+            elif engine_choice == "Kitten TTS":
+                success = narrate_with_kittentts(cleaned, path)
+                if not success:
+                    st.warning(f"⚠️ Failed to narrate MCQ #{i}")
+
+            # 🔁 Fallback logic
+            if not success:
+                st.info(f"🔁 Trying fallback engine for MCQ #{i}")
+
+            # Cloud-safe fallback order
+            fallback_order = ["Kitten TTS", "gTTS", "ElevenLabs"]
+
+            for fallback in fallback_order:
+                if fallback == engine_choice:
+                    continue  # Skip the engine we already tried
+
+                try:
+                    if fallback == "Kitten TTS":
+                        success = narrate_with_kittentts(cleaned, path)
+                    elif fallback == "gTTS":
+                        success = narrate_with_gtts(cleaned, path)
+                    elif fallback == "ElevenLabs":
+                        success = narrate_with_elevenlabs(cleaned, path, voice_id, api_key)
+
+                    if success:
+                        st.success(f"✅ Fallback succeeded with {fallback} for MCQ #{i}")
+                        break
+
+                except Exception as e:
+                    st.warning(f"❌ Fallback {fallback} failed: {e}")
+
+            progress.progress(i / len(mcqs))
         st.success("✅ Narration complete")
 
 # List new audio files
